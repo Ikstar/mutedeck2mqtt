@@ -1,0 +1,249 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+)
+
+// MuteDeck's /v1 HTTP API (see http://localhost:3491/swagger-ui on the MuteDeck host).
+// Only used when MUTEDECK_API_URL is set; without it the bridge is webhook-only.
+type muteDeckAPI struct {
+	baseURL string
+	token   string
+	client  *http.Client
+}
+
+// Settings for the one MuteDeck instance the API controls
+var api *muteDeckAPI
+var apiPrefix = "mutedeck2mqtt"
+var apiTopic = "mutedeck"
+
+// Last availability published for the API device, nil until the first poll
+var apiAvailable *bool
+var availMu sync.Mutex
+
+func newMuteDeckAPI(baseURL, token string) *muteDeckAPI {
+	return &muteDeckAPI{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		token:   token,
+		client:  &http.Client{Timeout: 3 * time.Second},
+	}
+}
+
+func (a *muteDeckAPI) do(method, path string, query url.Values) ([]byte, error) {
+	u := a.baseURL + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+	req, err := http.NewRequest(method, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	if a.token != "" {
+		req.Header.Set("Authorization", "Bearer "+a.token)
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return body, fmt.Errorf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return body, nil
+}
+
+func (a *muteDeckAPI) status() (map[string]interface{}, error) {
+	body, err := a.do(http.MethodGet, "/v1/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// action posts to /v1/<endpoint>. MuteDeck answers HTTP 200 with a body status of 400
+// when it cannot act (for example video outside a call), so the body is checked too.
+func (a *muteDeckAPI) action(endpoint, state string) error {
+	query := url.Values{}
+	if state != "" {
+		query.Set("state", state)
+	}
+	body, err := a.do(http.MethodPost, "/v1/"+endpoint, query)
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Status  int    `json:"status"`
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &result) == nil && result.Status != 0 && result.Status != http.StatusOK {
+		return fmt.Errorf("MuteDeck refused %s: %d %s %s", endpoint, result.Status, result.Reason, result.Message)
+	}
+	return nil
+}
+
+// commandFor maps an MQTT command to a MuteDeck API call and the state MuteDeck should
+// report afterwards. The Microphone switch is ON when the mic is live, so ON unmutes.
+func commandFor(field, payload string) (endpoint, state string, predicted map[string]interface{}, err error) {
+	payload = strings.ToUpper(strings.TrimSpace(payload))
+	switch field {
+	case "mute":
+		switch payload {
+		case "ON":
+			return "mute", "off", map[string]interface{}{"mute": "inactive"}, nil
+		case "OFF":
+			return "mute", "on", map[string]interface{}{"mute": "active"}, nil
+		case "TOGGLE":
+			return "mute", "toggle", nil, nil
+		}
+	case "video":
+		switch payload {
+		case "ON":
+			return "video", "on", map[string]interface{}{"video": "active"}, nil
+		case "OFF":
+			return "video", "off", map[string]interface{}{"video": "inactive"}, nil
+		case "TOGGLE":
+			return "video", "toggle", nil, nil
+		}
+	case "leave":
+		if payload == "PRESS" || payload == "" {
+			return "leave", "", nil, nil
+		}
+	default:
+		return "", "", nil, fmt.Errorf("unknown command %q", field)
+	}
+	return "", "", nil, fmt.Errorf("unknown payload %q for %s", payload, field)
+}
+
+func apiStateTopic() string {
+	return fmt.Sprintf("%s/%s", apiPrefix, apiTopic)
+}
+
+func apiAvailabilityTopic() string {
+	return fmt.Sprintf("%s/%s/availability", apiPrefix, apiTopic)
+}
+
+func bridgeStatusTopic() string {
+	return fmt.Sprintf("%s/status", apiPrefix)
+}
+
+// subscribeCommands listens for switch and button commands from Home Assistant.
+// Called from the MQTT on-connect handler, so subscriptions survive reconnects.
+func subscribeCommands(client mqtt.Client, discoveryPrefix string) {
+	handler := func(client mqtt.Client, msg mqtt.Message) {
+		// <prefix>/<topic>/<field>/set or <prefix>/<topic>/leave
+		field := strings.TrimSuffix(strings.TrimPrefix(msg.Topic(), apiStateTopic()+"/"), "/set")
+		go handleCommand(client, discoveryPrefix, field, string(msg.Payload()))
+	}
+	for _, topic := range []string{apiStateTopic() + "/+/set", apiStateTopic() + "/leave"} {
+		if token := client.Subscribe(topic, 0, handler); token.Wait() && token.Error() != nil {
+			logMessage(ERROR, fmt.Sprintf("Error subscribing to %s: %v", topic, token.Error()))
+		} else {
+			logMessage(INFO, fmt.Sprintf("Listening for commands on %s", topic))
+		}
+	}
+}
+
+func handleCommand(client mqtt.Client, discoveryPrefix, field, payload string) {
+	endpoint, state, predicted, err := commandFor(field, payload)
+	if err != nil {
+		logMessage(WARN, fmt.Sprintf("Ignoring command: %v", err))
+		return
+	}
+	logMessage(INFO, fmt.Sprintf("Command %s=%s -> /v1/%s state=%q", field, payload, endpoint, state))
+	if err := api.action(endpoint, state); err != nil {
+		logMessage(ERROR, fmt.Sprintf("Command %s=%s failed: %v", field, payload, err))
+		// Publish what MuteDeck really reports so HA drops back from the requested state
+		refreshStatus(client, discoveryPrefix, false)
+		return
+	}
+
+	// Show the expected state at once instead of waiting for the webhook or the next
+	// poll, then confirm it against MuteDeck shortly after.
+	if predicted != nil {
+		if err := publishState(client, discoveryPrefix, apiPrefix, apiTopic, predicted, false); err != nil {
+			logMessage(ERROR, fmt.Sprintf("Error publishing predicted state: %v", err))
+		}
+	}
+	for _, delay := range []time.Duration{300 * time.Millisecond, 1500 * time.Millisecond} {
+		time.Sleep(delay)
+		refreshStatus(client, discoveryPrefix, true)
+	}
+}
+
+// refreshStatus reads /v1/status, publishes it and updates availability
+func refreshStatus(client mqtt.Client, discoveryPrefix string, onlyIfChanged bool) {
+	data, err := api.status()
+	if err != nil {
+		if setAvailable(client, false) {
+			logMessage(WARN, fmt.Sprintf("MuteDeck unreachable, marking offline: %v", err))
+		}
+		return
+	}
+	if setAvailable(client, true) {
+		logMessage(INFO, "MuteDeck reachable, marking online")
+	}
+	if err := publishState(client, discoveryPrefix, apiPrefix, apiTopic, data, onlyIfChanged); err != nil {
+		logMessage(ERROR, fmt.Sprintf("Error publishing polled state: %v", err))
+	}
+}
+
+// setAvailable publishes the API device's availability, retained. It reports whether
+// the value changed.
+func setAvailable(client mqtt.Client, available bool) bool {
+	availMu.Lock()
+	defer availMu.Unlock()
+	if apiAvailable != nil && *apiAvailable == available {
+		return false
+	}
+	payload := "offline"
+	if available {
+		payload = "online"
+	}
+	token := client.Publish(apiAvailabilityTopic(), 1, true, payload)
+	token.Wait()
+	if token.Error() != nil {
+		logMessage(ERROR, fmt.Sprintf("Error publishing availability: %v", token.Error()))
+		return false
+	}
+	apiAvailable = &available
+	return true
+}
+
+// republishAvailability restores the retained availability after an MQTT reconnect
+func republishAvailability(client mqtt.Client) {
+	availMu.Lock()
+	defer availMu.Unlock()
+	if apiAvailable == nil {
+		return
+	}
+	payload := "offline"
+	if *apiAvailable {
+		payload = "online"
+	}
+	client.Publish(apiAvailabilityTopic(), 1, true, payload)
+}
+
+func pollStatus(client mqtt.Client, discoveryPrefix string, interval time.Duration) {
+	for {
+		refreshStatus(client, discoveryPrefix, true)
+		time.Sleep(interval)
+	}
+}
