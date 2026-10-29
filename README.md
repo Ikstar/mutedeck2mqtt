@@ -64,8 +64,10 @@ running it). For that device:
 | Leave meeting | button | Leaves the current meeting. Available only during a call |
 | Call, Control, Recording, Screen sharing | sensors | As before |
 
-How it stays responsive: after a command the bridge publishes the expected state at once,
-then reads `/v1/status` 0.3 s and 1.5 s later and publishes what MuteDeck reports. It also
+How it stays responsive: after a command the bridge publishes the expected state at once.
+MuteDeck's `/v1/status` lags a change by up to about 1.5 s, so the bridge then checks it
+every 0.5 s for up to 3 s and publishes once MuteDeck agrees, or publishes whatever MuteDeck
+reports when the window runs out. Polls pause during that window. It also
 polls `/v1/status` every `MUTEDECK_POLL_INTERVAL` seconds, so the state stays right even
 when a webhook is missed, and only publishes when something changed. The webhook still
 works and merges into the same device when it uses the same `topic` and `prefix`.

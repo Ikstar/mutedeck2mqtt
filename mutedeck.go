@@ -176,16 +176,72 @@ func handleCommand(client mqtt.Client, discoveryPrefix, field, payload string) {
 	}
 
 	// Show the expected state at once instead of waiting for the webhook or the next
-	// poll, then confirm it against MuteDeck shortly after.
+	// poll. MuteDeck's /v1/status lags the change by up to ~1.5 s, so publishing it
+	// straight away would flip the switch back for a moment. Instead, wait until
+	// MuteDeck agrees (or the window runs out) and then publish what it reports.
 	if predicted != nil {
 		if err := publishState(client, discoveryPrefix, apiPrefix, apiTopic, predicted, false); err != nil {
 			logMessage(ERROR, fmt.Sprintf("Error publishing predicted state: %v", err))
 		}
 	}
-	for _, delay := range []time.Duration{300 * time.Millisecond, 1500 * time.Millisecond} {
-		time.Sleep(delay)
-		refreshStatus(client, discoveryPrefix, true)
+	confirmCommand(client, discoveryPrefix, field, predicted)
+}
+
+// Polls skip publishing while a command is being confirmed, so a stale status
+// cannot overwrite the predicted state.
+var confirmUntil time.Time
+var confirmMu sync.Mutex
+
+func confirming() bool {
+	confirmMu.Lock()
+	defer confirmMu.Unlock()
+	return time.Now().Before(confirmUntil)
+}
+
+func confirmCommand(client mqtt.Client, discoveryPrefix, field string, predicted map[string]interface{}) {
+	const attempts = 6
+	const interval = 500 * time.Millisecond
+	confirmMu.Lock()
+	confirmUntil = time.Now().Add(attempts*interval + time.Second)
+	confirmMu.Unlock()
+	defer func() {
+		confirmMu.Lock()
+		confirmUntil = time.Time{}
+		confirmMu.Unlock()
+	}()
+
+	stateMu.Lock()
+	before := lastState[apiStateTopic()][field]
+	stateMu.Unlock()
+
+	for i := 1; i <= attempts; i++ {
+		time.Sleep(interval)
+		data, err := api.status()
+		if err != nil {
+			continue
+		}
+		settled := true
+		if predicted != nil {
+			for k, v := range predicted {
+				if data[k] != v {
+					settled = false
+				}
+			}
+		} else {
+			// A toggle has no prediction: settled once the field changes
+			settled = data[field] != before
+		}
+		if settled || i == attempts {
+			if !settled {
+				logMessage(WARN, fmt.Sprintf("MuteDeck did not confirm %s within %s, publishing what it reports", field, attempts*interval))
+			}
+			if err := publishState(client, discoveryPrefix, apiPrefix, apiTopic, data, true); err != nil {
+				logMessage(ERROR, fmt.Sprintf("Error publishing confirmed state: %v", err))
+			}
+			return
+		}
 	}
+	// Every attempt failed to reach MuteDeck; the poller takes over availability
 }
 
 // refreshStatus reads /v1/status, publishes it and updates availability
@@ -243,7 +299,9 @@ func republishAvailability(client mqtt.Client) {
 
 func pollStatus(client mqtt.Client, discoveryPrefix string, interval time.Duration) {
 	for {
-		refreshStatus(client, discoveryPrefix, true)
+		if !confirming() {
+			refreshStatus(client, discoveryPrefix, true)
+		}
 		time.Sleep(interval)
 	}
 }
